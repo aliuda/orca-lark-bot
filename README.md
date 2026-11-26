@@ -2,6 +2,10 @@
 
 将飞书 / Lark 企业自建应用机器人通过**官方 WebSocket 长连接（免公网域名）**桥接到你本机的 **Orca Bot**。
 
+| 连接状态与 Owner 认主配对 | 基础配置与最近飞书请求流 |
+| :---: | :---: |
+| ![Lark Bot Bridge status and owner pairing](docs/screenshot-status.png) | ![Lark Bot Bridge settings and recent requests](docs/screenshot-settings-requests.png) |
+
 - **确定性双向通信**：入站经 `webhook.call`（`subject-from=body.request_id`）唤醒本机 Orca Bot（内置网络异常/超时/429/5xx 指数退避自动重试与底层原因透出），Bot 通过零依赖本地 Stdio MCP（`scripts/mcp-bridge.mjs`）凭不透明 `request_id` 回传阶段进度与最终结果，并发乱序零串台，Bot 零接触飞书密钥与会话 ID。
 - **`/<BotName>` 路径式多 Bot 路由**：白名单群通过 `@机器人 /<BotName> <需求>` 精准触发对应 Orca Bot（大小写不敏感，无硬编码指令）；私聊默认直通 `targetBot`，亦支持 `/<BotName> <需求>` 按需路由到 `botRoutes` 中的其他 Bot。
 - **零运行时依赖分发**：内置基于 Node 原生 `WebSocket`/`fetch` 的飞书 `pbbp2.Frame` 长连接与 IM OpenAPI 客户端（不提交 `node_modules`，也支持动态适配 `@larksuiteoapi/node-sdk`）。
