@@ -1,0 +1,159 @@
+{
+  "manifestVersion": 2,
+  "id": "lark-bot-bridge",
+  "name": "Lark Bot Bridge",
+  "version": "0.1.0",
+  "description": "Bridge a Feishu/Lark self-built bot over persistent WebSocket to your local Orca Bot.",
+  "repository": "https://github.com/aliuda/orca-lark-bot",
+  "license": "MIT",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "lark-bot",
+        "title": "Lark Bot",
+        "icon": "bot",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "lark-bridge-status",
+        "text": "Lark: Offline",
+        "icon": "bot",
+        "tone": "neutral",
+        "tooltip": "Lark Bot Bridge status (click to reconnect)",
+        "command": "lark-bot-bridge.reconnect"
+      }
+    ],
+    "commands": [
+      {
+        "id": "lark-bot-bridge.reconnect",
+        "title": "Lark Bot: Reconnect",
+        "when": "global"
+      },
+      {
+        "id": "lark-bot-bridge.generate-pairing-code",
+        "title": "Lark Bot: Generate Owner Pairing Code",
+        "when": "global"
+      },
+      {
+        "id": "lark-bot-bridge.status",
+        "title": "Lark Bot: Show Bridge Status",
+        "when": "global"
+      }
+    ],
+    "settings": [
+      {
+        "key": "appId",
+        "title": "Feishu App ID",
+        "description": "Self-built app ID from Feishu/Lark Open Platform (e.g. cli_xxxx).",
+        "type": "string",
+        "default": "",
+        "placeholder": "cli_a1b2c3d4e5f6"
+      },
+      {
+        "key": "domain",
+        "title": "Feishu Open API Domain",
+        "description": "Feishu CN or international Lark Open API base domain.",
+        "type": "string",
+        "default": "https://open.feishu.cn",
+        "enum": [
+          "https://open.feishu.cn",
+          "https://open.larksuite.com"
+        ],
+        "enumLabels": [
+          "Feishu (open.feishu.cn)",
+          "Lark (open.larksuite.com)"
+        ]
+      },
+      {
+        "key": "targetBot",
+        "title": "Target Orca Bot",
+        "description": "Local Orca Bot name that receives Feishu requests (for example: MyBot).",
+        "type": "string",
+        "default": "MyBot",
+        "placeholder": "MyBot"
+      },
+      {
+        "key": "webhookUrl",
+        "title": "Orca Bot Webhook URL",
+        "description": "Webhook URL copied from the Bot's webhook.call automation card in Orca.",
+        "type": "string",
+        "default": "",
+        "placeholder": "https://..."
+      },
+      {
+        "key": "allowedChatIds",
+        "title": "Allowed Group Chat IDs",
+        "description": "Comma or newline separated opt-in Feishu group chat_ids where @bot /agent is enabled.",
+        "type": "string",
+        "default": "",
+        "multiline": true,
+        "placeholder": "oc_xxxx, oc_yyyy"
+      },
+      {
+        "key": "transportMode",
+        "title": "Feishu Transport Mode",
+        "description": "Use @larksuiteoapi/node-sdk when installed or the built-in zero-dependency WebSocket client.",
+        "type": "string",
+        "default": "auto",
+        "enum": [
+          "auto",
+          "direct",
+          "node-sdk"
+        ],
+        "enumLabels": [
+          "Auto (Node SDK if installed, else built-in WS)",
+          "Built-in Direct WS (zero dependencies)",
+          "Feishu Node SDK (@larksuiteoapi/node-sdk)"
+        ]
+      },
+      {
+        "key": "callbackPort",
+        "title": "Local Callback Port",
+        "description": "Loopback port on 127.0.0.1 for Bot MCP callbacks (0 picks an ephemeral port automatically).",
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 65535
+      },
+      {
+        "key": "requestTimeoutSec",
+        "title": "Request Timeout (seconds)",
+        "description": "Seconds before marking an unanswered Bot request as timed out and updating the Feishu card.",
+        "type": "integer",
+        "default": 300,
+        "minimum": 5,
+        "maximum": 3600
+      },
+      {
+        "key": "autoConnect",
+        "title": "Auto Connect on Startup",
+        "description": "Automatically start the Feishu persistent WebSocket connection when credentials are present.",
+        "type": "boolean",
+        "default": true
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "secrets:own"
+    },
+    {
+      "kind": "settings:own"
+    },
+    {
+      "kind": "notifications:show"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "orca-lark-bot-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "validate": "orca plugin validate . --json",
+    "check": "orca plugin check . --json",
+    "test": "orca plugin test . --json"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
