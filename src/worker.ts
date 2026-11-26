@@ -282,8 +282,12 @@ export class BridgeWorkerController {
       })
     )
 
-    // Start local loopback callback server when any webhook is configured or test explicitly asks.
-    if (this.overrides?.startCallbackServer === true || this.hasAnyWebhookConfigured()) {
+    // Start local loopback callback server when autoConnect is enabled and any webhook is configured
+    // (skipping autoConnect: false prevents offline `orca plugin check` runs from clobbering a live runtime.json).
+    if (
+      this.overrides?.startCallbackServer === true ||
+      (this.settings.autoConnect && this.hasAnyWebhookConfigured())
+    ) {
       await this.ensureCallbackServer()
     }
 
