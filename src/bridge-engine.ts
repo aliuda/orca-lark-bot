@@ -9,6 +9,7 @@ import {
 } from './guard'
 import { buildStageCard } from './lark/cards'
 import type { LarkIncomingMessage, LarkTransport } from './lark/types'
+import { maskWebhookUrl, resolveBotRoutes, summarizeBotRoutes } from './routes'
 import type { BridgeStore } from './store'
 import type {
   BridgeRequestRecord,
@@ -35,17 +36,6 @@ function summarize(text: string, maxLen: number): string {
   const clean = text.replace(/\s+/g, ' ').trim()
   if (clean.length <= maxLen) return clean
   return `${clean.slice(0, maxLen - 1)}…`
-}
-
-function maskWebhookUrl(raw: string): string {
-  const trimmed = raw.trim()
-  if (!trimmed) return ''
-  try {
-    const u = new URL(trimmed)
-    return `${u.protocol}//${u.host}/…`
-  } catch {
-    return 'configured'
-  }
 }
 
 /**
@@ -128,6 +118,11 @@ export class BridgeEngine {
 
   getSnapshot(): BridgeSnapshot {
     const settings = this.getSettings()
+    const { defaultRoute, routes } = resolveBotRoutes({
+      targetBot: settings.targetBot,
+      webhookUrl: settings.webhookUrl,
+      botRoutes: settings.botRoutes
+    })
     const requests = this.store.listRequests(50)
     const recentRequests: RequestSummary[] = requests.map((r) => ({
       requestId: r.requestId,
@@ -136,6 +131,7 @@ export class BridgeEngine {
       chatType: r.chatType,
       threadId: r.threadId,
       conversationKey: r.conversationKey,
+      targetBot: r.targetBot,
       senderName: r.senderName,
       status: r.status,
       outcome: r.outcome,
@@ -159,12 +155,13 @@ export class BridgeEngine {
 
     const snapshot: BridgeSnapshot = {
       connection: this.getConnectionSnapshot(),
-      targetBot: settings.targetBot || 'MyBot',
+      targetBot: defaultRoute.name,
       appId: settings.appId,
       domain: settings.domain,
       hasAppSecret: this.hasAppSecret(),
-      webhookConfigured: settings.webhookUrl.trim().length > 0,
-      webhookUrlPreview: maskWebhookUrl(settings.webhookUrl),
+      webhookConfigured: routes.some((r) => r.webhookUrl.trim().length > 0),
+      webhookUrlPreview: maskWebhookUrl(defaultRoute.webhookUrl),
+      routes: summarizeBotRoutes(routes),
       allowedChatIds: parseAllowedChatIds(settings.allowedChatIds),
       requestTimeoutSec: settings.requestTimeoutSec,
       ownerPairing: this.store.getOwnerState(),
@@ -224,11 +221,18 @@ export class BridgeEngine {
     }
 
     const settings = this.getSettings()
+    const { defaultRoute, routes } = resolveBotRoutes({
+      targetBot: settings.targetBot,
+      webhookUrl: settings.webhookUrl,
+      botRoutes: settings.botRoutes
+    })
     const transport = this.getTransport()
     const conn = this.getConnectionSnapshot()
     const decision = evaluateIncomingMessage(msg, {
       ownerState: this.store.getOwnerState(),
       allowedChatIds: parseAllowedChatIds(settings.allowedChatIds),
+      defaultRoute,
+      routes,
       botOpenId: conn.botOpenId,
       now: currentNow
     })
@@ -270,11 +274,12 @@ export class BridgeEngine {
 
     // 2. Authorized request -> create opaque request_id and persist binding + initial record.
     const requestId = `req_${randomUUID()}`
-    const targetBot = settings.targetBot || 'MyBot'
+    const targetBot = decision.targetBot
     const timeoutMs = Math.max(5, settings.requestTimeoutSec) * 1000
     const conv = buildConversationKey({
       domain: settings.domain,
       appId: settings.appId,
+      targetBot,
       chatId: msg.chatId,
       chatType: msg.chatType,
       threadId: msg.threadId,
@@ -348,18 +353,21 @@ export class BridgeEngine {
       }
     }
 
-    // 4. Dispatch to Orca Bot webhook with opaque request_id.
-    const dispatchRes = await this.getDispatcher().dispatch({
-      request_id: requestId,
-      conversation_key: conv.conversationKey,
-      chat_type: msg.chatType,
-      message_id: msg.messageId,
-      thread_id: msg.threadId,
-      sender_name: msg.senderName || msg.senderOpenId,
-      target_bot: targetBot,
-      text: decision.promptText,
-      received_at: new Date(currentNow).toISOString()
-    })
+    // 4. Dispatch to Orca Bot webhook with opaque request_id and resolved route URL.
+    const dispatchRes = await this.getDispatcher().dispatch(
+      {
+        request_id: requestId,
+        conversation_key: conv.conversationKey,
+        chat_type: msg.chatType,
+        message_id: msg.messageId,
+        thread_id: msg.threadId,
+        sender_name: msg.senderName || msg.senderOpenId,
+        target_bot: targetBot,
+        text: decision.promptText,
+        received_at: new Date(currentNow).toISOString()
+      },
+      { webhookUrl: decision.webhookUrl }
+    )
 
     if (!dispatchRes.accepted) {
       await this.transitionTerminal(requestId, 'failed', {

@@ -2,9 +2,10 @@
 
 将飞书 / Lark 企业自建应用机器人通过**官方 WebSocket 长连接（免公网域名）**桥接到你本机的 **Orca Bot**。
 
-- **确定性双向通信**：入站经 `webhook.call`（`subject-from=body.request_id`）唤醒本机 Orca Bot，Bot 通过零依赖本地 Stdio MCP（`scripts/mcp-bridge.mjs`）凭不透明 `request_id` 回传阶段进度与最终结果，并发乱序零串台，Bot 零接触飞书密钥与会话 ID。
+- **确定性双向通信**：入站经 `webhook.call`（`subject-from=body.request_id`）唤醒本机 Orca Bot（内置网络异常/超时/429/5xx 指数退避自动重试与底层原因透出），Bot 通过零依赖本地 Stdio MCP（`scripts/mcp-bridge.mjs`）凭不透明 `request_id` 回传阶段进度与最终结果，并发乱序零串台，Bot 零接触飞书密钥与会话 ID。
+- **`/<BotName>` 路径式多 Bot 路由**：白名单群通过 `@机器人 /<BotName> <需求>` 精准触发对应 Orca Bot（大小写不敏感，无硬编码指令）；私聊默认直通 `targetBot`，亦支持 `/<BotName> <需求>` 按需路由到 `botRoutes` 中的其他 Bot。
 - **零运行时依赖分发**：内置基于 Node 原生 `WebSocket`/`fetch` 的飞书 `pbbp2.Frame` 长连接与 IM OpenAPI 客户端（不提交 `node_modules`，也支持动态适配 `@larksuiteoapi/node-sdk`）。
-- **安全边界**：私聊 6 位随机配对码认主（10 分钟有效、5 次错误作废）、Owner 私聊直通、opt-in 白名单群 `@bot /agent <需求>` 触发、`App Secret` 加密存储于 Orca `secrets:own`。
+- **安全边界**：私聊 6 位随机配对码认主（10 分钟有效、5 次错误作废；已配对 Owner 再次发 `/pair` 自动拦截提示不唤醒 Bot）、Owner 私聊直通、opt-in 白名单群触发、`App Secret` 加密存储于 Orca `secrets:own`（面板保存凭证/配置后自动重连）。
 
 ---
 
@@ -17,7 +18,7 @@
    - `im:message` — 读取/发送/更新消息基础权限
    - `im:message:send_as_bot` — 以机器人身份发送/回复消息及更新卡片
    - `im:message.p2p_msg:readonly` — 接收用户发给机器人的私聊消息
-   - `im:message.group_at_msg:readonly` — *(可选)* 仅当开启白名单群 `@bot /agent` 时需要（无需敏感的全群消息读取权限）
+   - `im:message.group_at_msg:readonly` — *(可选)* 仅当开启白名单群 `@机器人 /<BotName>` 时需要（无需敏感的全群消息读取权限）
    - `im:message.reactions:write_only` — *(可选)* `OnIt` → `DONE` 表情反馈（缺失时自动降级，不影响主流程）
 3. **事件与回调**：
    - 订阅方式选择 **「使用长连接接收事件（Persistent Connection）」**（无需公网域名与回调地址）
@@ -52,7 +53,7 @@ orca plugin dev load ./orca-lark-bot --json
 
 ## 3. 3 步接入 Orca Bot 并完成认主
 
-将命令中的 `<BotName>` 替换为你的本机 Orca Bot 名称，`<PLUGIN_DIR>` 替换为插件目录路径：
+将命令中的 `<BotName>` 替换为你的本机 Orca Bot 名称（例如 `MyBot`），`<PLUGIN_DIR>` 替换为插件目录路径：
 
 ### Step 1：为 Bot 挂载回传 MCP 工具（一次性）
 
@@ -78,11 +79,23 @@ orca automations create \
 ### Step 3：面板录入凭证 + 6 位配对码认主
 
 1. 打开 Orca 右侧边栏 **`Lark Bot`** 面板；
-2. 填入 **Feishu App ID**、**Target Orca Bot**、粘贴上一步复制的 **Orca Bot Webhook URL**，点击「保存基础配置」；
-3. 输入 **Feishu App Secret** 并点击「保存 Secret」（加密写入 `secrets:own`）；
-4. 点击 **Reconnect**，等待状态变为 **`Online`**；
-5. 点击「**生成配对码**」，在飞书私聊该机器人发送 `/pair <6位配对码>` 完成 Owner 认主；
-6. 之后直接私聊机器人发送需求（或在白名单群内 `@机器人 /agent <需求>`）即可触发 Orca Bot 并原地收到进度卡与最终结果。
+2. 填入 **Feishu App ID**、**Target Orca Bot**（例如 `MyBot`）、粘贴上一步复制的 **Orca Bot Webhook URL**，点击「保存基础配置」；
+3. 输入 **Feishu App Secret** 并点击「保存 Secret」（加密写入 `secrets:own`，凭证就绪后自动触发长连接重连）；
+4. 确认顶部状态变为 **`Online`** 后，点击「**生成配对码**」，在飞书私聊该机器人发送 `/pair <6位配对码>` 完成 Owner 认主；
+5. 开始使用：
+   - **私聊（DM）**：直接发消息默认直通 `Target Orca Bot`；若在插件设置 `botRoutes` 中配置了额外路由，可用 `/<BotName> <需求>`（例如 `/Coder 帮我跑单测`）精准路由到对应 Bot；
+   - **白名单群**：在插件设置 `allowedChatIds` 加入群 `chat_id` 后，群内发送 `@机器人 /<BotName> <需求>`（例如 `@机器人 /MyBot 帮我看下当前分支改动`，大小写不敏感）即可触发。
+
+### 多 Bot 路由配置（可选）
+
+在 Orca 设置 → Plugins → **Lark Bot Bridge** → **Additional Bot Routes (`botRoutes`)** 中按每行一条或 JSON 对象配置额外 Bot：
+
+```text
+Coder=https://<webhook-url-for-coder>
+Reviewer=https://<webhook-url-for-reviewer>
+```
+
+> Webhook URL 仅保存在插件配置中，日志、错误提示与右侧面板均只展示脱敏路由名，绝不回显明文 URL 或密钥。
 
 ---
 

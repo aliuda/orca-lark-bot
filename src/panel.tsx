@@ -85,7 +85,10 @@ async function handleSaveSecret(): Promise<void> {
   await runAction('saveSecret', async () => {
     await plugin.request('bridge.saveSecret', { appSecret: secret })
     set(secretDraftAtom, '')
-    set(noticeAtom, { tone: 'success', text: 'App Secret 已安全写入 Orca secrets:own。' })
+    set(noticeAtom, {
+      tone: 'success',
+      text: 'App Secret 已安全写入 Orca secrets:own，凭证就绪后将自动连接。'
+    })
     await refreshSnapshot()
   })
 }
@@ -111,7 +114,10 @@ async function handleSaveQuickConfig(): Promise<void> {
     const snap = await plugin.request('bridge.updateSettings', patch)
     set(snapshotAtom, snap)
     if (webhookUrl) set(webhookDraftAtom, '')
-    set(noticeAtom, { tone: 'success', text: '基础配置已保存到插件设置。' })
+    set(noticeAtom, {
+      tone: 'success',
+      text: '基础配置已保存到插件设置，凭证就绪后将自动连接。'
+    })
   })
 }
 
@@ -264,11 +270,11 @@ export default function LarkBotPanel() {
         </Callout>
       ) : null}
 
-      <Card title="连接与目标 Bot" description="飞书官方长连接（免公网域名）+ 本机 Bot Webhook 双向桥接">
+      <Card title="连接与目标 Bot" description="飞书官方长连接（免公网域名）+ /<BotName> 多 Bot 路径路由">
         <Stack gap="sm">
           <Row justify="between" align="center">
             <Text size="sm" muted>
-              目标 Orca Bot
+              默认 Orca Bot
             </Text>
             <Badge tone="accent">{snap.targetBot}</Badge>
           </Row>
@@ -280,6 +286,22 @@ export default function LarkBotPanel() {
               {snap.webhookConfigured ? 'Configured' : 'Not Set'}
             </Badge>
           </Row>
+          <Row justify="between" align="center" wrap>
+            <Text size="sm" muted>
+              已配置路由 ({snap.routes.length})
+            </Text>
+            <Row gap="xs" wrap>
+              {snap.routes.map((route) => (
+                <Badge key={route.name} tone={route.webhookConfigured ? 'success' : 'warning'}>
+                  {`/${route.name}`}
+                </Badge>
+              ))}
+            </Row>
+          </Row>
+          <Text size="xs" muted>
+            白名单群请使用 <Code>{`@机器人 /${snap.targetBot} <需求>`}</Code>；私聊默认直通，也可通过{' '}
+            <Code>{'/<BotName> <需求>'}</Code> 路由到已配置的额外 Bot。
+          </Text>
           <Row justify="between" align="center">
             <Text size="sm" muted>
               传输模式 / 回调服务
@@ -474,8 +496,9 @@ export default function LarkBotPanel() {
                 description={req.errorMessage ?? req.answerPreview ?? req.requestId}
               >
                 <Row gap="xs" align="center" justify="between">
-                  <Row gap="xs" align="center">
+                  <Row gap="xs" align="center" wrap>
                     <Badge tone={requestTone(req)}>{requestLabel(req)}</Badge>
+                    <Badge tone="accent">{req.targetBot}</Badge>
                     <Badge tone="neutral">{req.chatType === 'p2p' ? 'DM' : 'Group'}</Badge>
                   </Row>
                   <RelativeTime at={req.createdAt} muted />

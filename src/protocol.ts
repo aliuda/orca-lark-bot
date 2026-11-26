@@ -2,7 +2,7 @@
 import type { BridgeSettings, BridgeSnapshot, ConnectionState } from './types'
 
 export type SettingsPatch = Partial<
-  Pick<BridgeSettings, 'appId' | 'domain' | 'targetBot' | 'webhookUrl' | 'allowedChatIds'>
+  Pick<BridgeSettings, 'appId' | 'domain' | 'targetBot' | 'webhookUrl' | 'botRoutes' | 'allowedChatIds'>
 >
 
 declare module 'orca' {

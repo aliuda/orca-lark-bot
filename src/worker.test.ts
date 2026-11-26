@@ -1,5 +1,5 @@
 import { afterEach, assert, mockHost, mountWorker, test } from 'orca/testing'
-import type { BotDispatchPayload, BotDispatcher } from './bot/webhook-dispatcher'
+import type { BotDispatchOptions, BotDispatchPayload, BotDispatcher } from './bot/webhook-dispatcher'
 import type { LarkIncomingMessage } from './lark/types'
 import { MockLarkTransport } from './mock-transport'
 import * as main from './worker'
@@ -24,15 +24,15 @@ function makeMessage(overrides: Partial<LarkIncomingMessage> = {}): LarkIncoming
 
 function makeMockDispatcher(): {
   dispatcher: BotDispatcher
-  dispatched: BotDispatchPayload[]
+  dispatched: Array<{ payload: BotDispatchPayload; webhookUrl?: string }>
 } {
-  const dispatched: BotDispatchPayload[] = []
+  const dispatched: Array<{ payload: BotDispatchPayload; webhookUrl?: string }> = []
   return {
     dispatched,
     dispatcher: {
-      async dispatch(payload) {
-        dispatched.push(payload)
-        return { accepted: true, statusCode: 200 }
+      async dispatch(payload: BotDispatchPayload, options?: BotDispatchOptions) {
+        dispatched.push({ payload, webhookUrl: options?.webhookUrl })
+        return { accepted: true, statusCode: 200, attempts: 1 }
       }
     }
   }
@@ -87,7 +87,7 @@ test('concurrent out-of-order completion routes each answer back to its exact me
   )
   assert.equal(dispatched.length, 0, 'pairing message must not wake Bot')
 
-  // Fire Req-1 and Req-2 back-to-back in the SAME opt-in group chat with different threads.
+  // Fire Req-1 and Req-2 back-to-back in the SAME opt-in group chat using /<BotName> (case-insensitive).
   await transport.simulateIncoming(
     makeMessage({
       messageId: 'om_req_1',
@@ -95,7 +95,7 @@ test('concurrent out-of-order completion routes each answer back to its exact me
       chatType: 'group',
       threadId: 'omt_thread_1',
       senderOpenId: 'ou_owner_1',
-      text: '@MyBot /agent 检查任务一',
+      text: '@MyBot /MyBot 检查任务一',
       mentions: [{ key: '@_user_1', openId: 'ou_bot_demo', name: 'MyBot' }]
     })
   )
@@ -107,19 +107,21 @@ test('concurrent out-of-order completion routes each answer back to its exact me
       chatType: 'group',
       threadId: 'omt_thread_2',
       senderOpenId: 'ou_owner_1',
-      text: '@MyBot /agent 检查任务二',
+      text: '@MyBot /mybot: 检查任务二',
       mentions: [{ key: '@_user_1', openId: 'ou_bot_demo', name: 'MyBot' }]
     })
   )
 
   assert.equal(dispatched.length, 2)
-  const req1 = dispatched[0]
-  const req2 = dispatched[1]
+  const req1 = dispatched[0].payload
+  const req2 = dispatched[1].payload
   assert.notEqual(req1.request_id, req2.request_id)
   assert.equal(req1.message_id, 'om_req_1')
   assert.equal(req1.thread_id, 'omt_thread_1')
+  assert.equal(req1.target_bot, 'MyBot')
   assert.equal(req2.message_id, 'om_req_2')
   assert.equal(req2.thread_id, 'omt_thread_2')
+  assert.equal(req2.target_bot, 'MyBot')
 
   // Initial cards were posted to their exact respective messages in-thread.
   assert.equal(transport.cardReplies.length, 2)
@@ -201,7 +203,7 @@ test('concurrent out-of-order completion routes each answer back to its exact me
   await worker.deactivate()
 })
 
-test('dedupes duplicate message_id, blocks non-owner DM without waking Bot, and recovers bindings & dedupe across worker restart', async () => {
+test('dedupes duplicate message_id, blocks non-owner DM and repeated owner /pair without waking Bot, and recovers across restart', async () => {
   let fakeNow = 1_795_667_000_000
   let transport = new MockLarkTransport()
   const { dispatcher, dispatched } = makeMockDispatcher()
@@ -250,7 +252,25 @@ test('dedupes duplicate message_id, blocks non-owner DM without waking Bot, and 
     })
   )
 
-  // 3. Non-owner DM after pairing is still rejected without waking Bot.
+  // 3. Paired Owner sending `/pair` or `/pair 123456` is intercepted directly and NEVER wakes Bot.
+  await transport.simulateIncoming(
+    makeMessage({
+      messageId: 'om_owner_repeat_pair_1',
+      senderOpenId: 'ou_owner_real',
+      text: '/pair 123456'
+    })
+  )
+  await transport.simulateIncoming(
+    makeMessage({
+      messageId: 'om_owner_repeat_pair_2',
+      senderOpenId: 'ou_owner_real',
+      text: '/pair'
+    })
+  )
+  assert.equal(dispatched.length, 0, 'already-paired owner /pair must not wake Bot')
+  assert.match(transport.textReplies.at(-1)?.text ?? '', /已完成 Owner 配对/)
+
+  // 4. Non-owner DM after pairing (without active pending code) is rejected without waking Bot.
   await transport.simulateIncoming(
     makeMessage({
       messageId: 'om_other_user_dm',
@@ -261,7 +281,19 @@ test('dedupes duplicate message_id, blocks non-owner DM without waking Bot, and 
   assert.equal(dispatched.length, 0)
   assert.match(transport.textReplies.at(-1)?.text ?? '', /已绑定其他 Owner/)
 
-  // 4. Owner DM dispatches once; re-delivering the exact same message_id is deduped!
+  // 5. Non-owner sending `/pair <bad>` while a new pairing code exists still goes through pairing verification.
+  await worker1.request('bridge.generatePairingCode')
+  await transport.simulateIncoming(
+    makeMessage({
+      messageId: 'om_other_user_pair_bad',
+      senderOpenId: 'ou_stranger_2',
+      text: '/pair 000000'
+    })
+  )
+  assert.equal(dispatched.length, 0)
+  assert.match(transport.textReplies.at(-1)?.text ?? '', /配对码不正确/)
+
+  // 6. Owner DM dispatches once; re-delivering the exact same message_id is deduped!
   await transport.simulateIncoming(
     makeMessage({
       messageId: 'om_owner_msg_1',
@@ -278,7 +310,7 @@ test('dedupes duplicate message_id, blocks non-owner DM without waking Bot, and 
   )
   assert.equal(dispatched.length, 1, 'duplicate message_id must only dispatch once')
 
-  // 5. Simulate WORKER RESTART on the SAME host (preserving orca.storage, wiping in-memory state).
+  // 7. Simulate WORKER RESTART on the SAME host (preserving orca.storage, wiping in-memory state).
   await worker1.deactivate()
   transport = new MockLarkTransport()
   setWorkerTestOverrides({
@@ -292,7 +324,7 @@ test('dedupes duplicate message_id, blocks non-owner DM without waking Bot, and 
   const snapAfterRestart = await worker2.request('bridge.getSnapshot')
   assert.equal(snapAfterRestart.ownerPairing.ownerOpenId, 'ou_owner_real')
   assert.equal(snapAfterRestart.stats.bindingsCount, 1)
-  assert.ok(snapAfterRestart.stats.dedupedMessages >= 4)
+  assert.ok(snapAfterRestart.stats.dedupedMessages >= 6)
 
   // Replaying `om_owner_msg_1` AFTER restart must STILL be deduped from persisted storage!
   await transport.simulateIncoming(
@@ -314,8 +346,8 @@ test('dedupes duplicate message_id, blocks non-owner DM without waking Bot, and 
   )
   assert.equal(dispatched.length, 2)
   assert.equal(
-    dispatched[1].conversation_key,
-    dispatched[0].conversation_key,
+    dispatched[1].payload.conversation_key,
+    dispatched[0].payload.conversation_key,
     'same DM session keeps stable conversation_key across restart'
   )
   assert.deepEqual(worker2.refusals, [])
@@ -364,7 +396,7 @@ test('updates Feishu card to timeout state when Bot never calls back and rejects
     })
   )
   assert.equal(dispatched.length, 1)
-  const reqId = dispatched[0].request_id
+  const reqId = dispatched[0].payload.request_id
   const initialCardId = transport.cardReplies[0].replyMessageId
 
   // Advance clock past 30s deadline and sweep timeouts.
@@ -393,7 +425,7 @@ test('updates Feishu card to timeout state when Bot never calls back and rejects
   assert.equal(late.ok, false)
   assert.equal(late.code, 'already_settled')
 
-  // Verify reply_in_thread fallback behavior when patchCard fails too.
+  // Verify reply_in_thread fallback behavior when thread creation is rejected.
   transport.failThreadReplyForMessageIds.add('om_fallback_msg')
   await transport.simulateIncoming(
     makeMessage({
@@ -413,7 +445,7 @@ test('updates Feishu card to timeout state when Bot never calls back and rejects
   await worker.deactivate()
 })
 
-test('enforces opt-in group allowlist, @bot /agent prefix, pairing lockout/expiry, and restart timeout recovery', async () => {
+test('supports /<BotName> case-insensitive multi-bot routing, boundary guards, pairing lockout/expiry, and restart timeout recovery', async () => {
   let fakeNow = 1_795_669_000_000
   let transport = new MockLarkTransport({ botOpenId: 'ou_bot_demo' })
   const { dispatcher, dispatched } = makeMockDispatcher()
@@ -430,7 +462,8 @@ test('enforces opt-in group allowlist, @bot /agent prefix, pairing lockout/expir
       appId: 'cli_team_app',
       domain: 'https://open.feishu.cn',
       targetBot: 'MyBot',
-      webhookUrl: 'https://orca.local/webhook/mock',
+      webhookUrl: 'https://orca.local/webhook/mybot',
+      botRoutes: 'Coder=https://orca.local/webhook/coder\nReviewer=https://orca.local/webhook/reviewer',
       allowedChatIds: 'oc_allowed_group',
       requestTimeoutSec: 30,
       autoConnect: true
@@ -485,56 +518,103 @@ test('enforces opt-in group allowlist, @bot /agent prefix, pairing lockout/expir
       chatId: 'oc_random_group',
       chatType: 'group',
       senderOpenId: 'ou_owner_1',
-      text: '@MyBot /agent 忽略我',
+      text: '@MyBot /MyBot 忽略我',
       mentions: [{ key: '@_user_1', openId: 'ou_bot_demo', name: 'MyBot' }]
     })
   )
   assert.equal(transport.textReplies.length, repliesBefore)
   assert.equal(dispatched.length, 0)
 
-  // 5. Listed group without `/agent` prefix (or `/agents`) is silently ignored.
+  // 5. Boundary guards: legacy `/agent` and prefix-colliding `/MyBot2` must NOT trigger in group!
   await transport.simulateIncoming(
     makeMessage({
-      messageId: 'om_no_prefix',
+      messageId: 'om_legacy_agent',
       chatId: 'oc_allowed_group',
       chatType: 'group',
       senderOpenId: 'ou_owner_1',
-      text: '@MyBot /agents 列出列表',
+      text: '@MyBot /agent 旧指令不触发',
+      mentions: [{ key: '@_user_1', openId: 'ou_bot_demo', name: 'MyBot' }]
+    })
+  )
+  await transport.simulateIncoming(
+    makeMessage({
+      messageId: 'om_prefix_collision',
+      chatId: 'oc_allowed_group',
+      chatType: 'group',
+      senderOpenId: 'ou_owner_1',
+      text: '@MyBot /MyBot2 不误匹配',
       mentions: [{ key: '@_user_1', openId: 'ou_bot_demo', name: 'MyBot' }]
     })
   )
   assert.equal(dispatched.length, 0)
 
-  // 6. Listed group with `@bot /agent` from non-owner is rejected without waking Bot.
+  // 6. Listed group with `@bot /<BotName>` from non-owner is rejected without waking Bot.
   await transport.simulateIncoming(
     makeMessage({
       messageId: 'om_group_non_owner',
       chatId: 'oc_allowed_group',
       chatType: 'group',
       senderOpenId: 'ou_other_member',
-      text: '@MyBot /agent 帮我删库',
+      text: '@MyBot /Coder 帮我删库',
       mentions: [{ key: '@_user_1', openId: 'ou_bot_demo', name: 'MyBot' }]
     })
   )
   assert.equal(dispatched.length, 0)
   assert.match(transport.textReplies.at(-1)?.text ?? '', /仅已配对的本机 Owner/)
 
-  // 7. Listed group with `@bot /agent` from Owner dispatches; then simulate crash & restart past deadline.
+  // 7. Group multi-bot routing: `@bot /coder ...` (case-insensitive) routes to `Coder` webhook & card!
   await transport.simulateIncoming(
     makeMessage({
-      messageId: 'om_group_ok_restart',
+      messageId: 'om_group_coder',
       chatId: 'oc_allowed_group',
       chatType: 'group',
       senderOpenId: 'ou_owner_1',
-      text: '@MyBot /agent 帮我排查构建',
+      text: '@MyBot /coder\n帮我排查构建',
       mentions: [{ key: '@_user_1', openId: 'ou_bot_demo', name: 'MyBot' }]
     })
   )
   assert.equal(dispatched.length, 1)
-  const pendingReqId = dispatched[0].request_id
+  assert.equal(dispatched[0].payload.target_bot, 'Coder')
+  assert.equal(dispatched[0].payload.text, '帮我排查构建')
+  assert.equal(dispatched[0].webhookUrl, 'https://orca.local/webhook/coder')
+  assert.match(cardText(transport.cardReplies.at(-1)!.card), /Coder/)
 
+  // 8. DM multi-bot routing: `/reviewer 审查 PR` routes to `Reviewer`, plain DM routes to default `MyBot`.
+  await transport.simulateIncoming(
+    makeMessage({
+      messageId: 'om_dm_reviewer',
+      chatId: 'oc_dm_owner',
+      chatType: 'p2p',
+      senderOpenId: 'ou_owner_1',
+      text: '/reviewer 审查这个 PR'
+    })
+  )
+  await transport.simulateIncoming(
+    makeMessage({
+      messageId: 'om_dm_default',
+      chatId: 'oc_dm_owner',
+      chatType: 'p2p',
+      senderOpenId: 'ou_owner_1',
+      text: '普通私聊默认路由'
+    })
+  )
+  assert.equal(dispatched.length, 3)
+  assert.equal(dispatched[1].payload.target_bot, 'Reviewer')
+  assert.equal(dispatched[1].payload.text, '审查这个 PR')
+  assert.equal(dispatched[1].webhookUrl, 'https://orca.local/webhook/reviewer')
+  assert.equal(dispatched[2].payload.target_bot, 'MyBot')
+  assert.equal(dispatched[2].payload.text, '普通私聊默认路由')
+  assert.equal(dispatched[2].webhookUrl, 'https://orca.local/webhook/mybot')
+  assert.notEqual(
+    dispatched[1].payload.conversation_key,
+    dispatched[2].payload.conversation_key,
+    'different target bots in same DM keep isolated conversation keys'
+  )
+
+  const pendingReqId = dispatched[0].payload.request_id
+
+  // 9. Restart past deadline auto-reconciles in-flight request to timeout -> posted.
   await worker1.deactivate()
-  // Restart 45s later (past 30s timeout): engine.initialize() should auto-reconcile to timeout -> posted!
   fakeNow += 45_000
   transport = new MockLarkTransport({ botOpenId: 'ou_bot_demo' })
   setWorkerTestOverrides({
@@ -552,4 +632,78 @@ test('enforces opt-in group allowlist, @bot /agent prefix, pairing lockout/expir
   assert.deepEqual(worker2.refusals, [])
 
   await worker2.deactivate()
+})
+
+test('automatically triggers non-blocking reconnect after saving App ID/domain and App Secret from sidebar', async () => {
+  const createdTransports: Array<{ appId: string; domain: string; secret: string; transport: MockLarkTransport }> = []
+
+  setWorkerTestOverrides({
+    createTransport: async (settings, appSecret) => {
+      const transport = new MockLarkTransport()
+      createdTransports.push({
+        appId: settings.appId,
+        domain: settings.domain,
+        secret: appSecret,
+        transport
+      })
+      return transport
+    },
+    startCallbackServer: false
+  })
+
+  // Start completely unconfigured (no appId, no secret).
+  const host = mockHost({
+    settings: {
+      appId: '',
+      domain: 'https://open.feishu.cn',
+      targetBot: 'MyBot',
+      webhookUrl: '',
+      autoConnect: true
+    }
+  })
+
+  const worker = await mountWorker(main, { host })
+  const ctrl = getActiveBridgeController()
+  assert.ok(ctrl)
+
+  const initialSnap = await worker.request('bridge.getSnapshot')
+  assert.equal(initialSnap.connection.state, 'unconfigured')
+  assert.equal(createdTransports.length, 0)
+
+  // Save App ID first (secret still missing -> should not connect yet).
+  await worker.request('bridge.updateSettings', {
+    appId: 'cli_auto_1',
+    webhookUrl: 'https://orca.local/webhook/auto'
+  })
+  await ctrl.waitForReconnect()
+  assert.equal(createdTransports.length, 0)
+
+  // Now save App Secret -> triggers async auto-reconnect automatically!
+  const saveRes = await worker.request('bridge.saveSecret', { appSecret: 'sec_auto_1' })
+  assert.equal(saveRes.hasAppSecret, true)
+  await ctrl.waitForReconnect()
+
+  assert.equal(createdTransports.length, 1)
+  assert.equal(createdTransports[0].appId, 'cli_auto_1')
+  assert.equal(createdTransports[0].secret, 'sec_auto_1')
+
+  const connectedSnap = await worker.request('bridge.getSnapshot')
+  assert.equal(connectedSnap.connection.state, 'connected')
+  assert.ok(
+    worker.posts.some(
+      (p) =>
+        p.event === 'bridge.snapshot' &&
+        (p.payload as { connection?: { state?: string } })?.connection?.state === 'connected'
+    ),
+    'panel receives pushed connected snapshot without manual Reconnect click'
+  )
+
+  // Changing domain while connected also triggers auto-reconnect with new domain.
+  await worker.request('bridge.updateSettings', { domain: 'https://open.larksuite.com' })
+  await ctrl.waitForReconnect()
+  assert.equal(createdTransports.length, 2)
+  assert.equal(createdTransports[1].domain, 'https://open.larksuite.com')
+  assert.deepEqual(worker.refusals, [])
+
+  await worker.deactivate()
 })

@@ -24,6 +24,20 @@ function makeSnapshot(overrides: Partial<BridgeSnapshot> = {}): BridgeSnapshot {
     hasAppSecret: false,
     webhookConfigured: true,
     webhookUrlPreview: 'https://hooks.orca.test/…',
+    routes: [
+      {
+        name: 'MyBot',
+        webhookConfigured: true,
+        webhookUrlPreview: 'https://hooks.orca.test/…',
+        isDefault: true
+      },
+      {
+        name: 'Coder',
+        webhookConfigured: true,
+        webhookUrlPreview: 'https://hooks.orca.test/…',
+        isDefault: false
+      }
+    ],
     allowedChatIds: ['oc_team_1'],
     requestTimeoutSec: 300,
     ownerPairing: {},
@@ -73,8 +87,11 @@ test('renders bridge status, generates pairing code, saves secret safely, and up
   view = await mount(panel, { host })
   assert.ok(view.find({ text: 'Lark Bot' }))
   assert.ok(view.find({ text: 'MyBot' }))
+  assert.ok(view.find({ text: '/MyBot' }))
+  assert.ok(view.find({ text: '/Coder' }))
   assert.ok(view.find({ text: 'Unpaired' }))
   assert.ok(view.find({ text: 'Missing' }))
+  assert.equal(JSON.stringify(view.tree()).includes('secret_token'), false)
 
   // Generate 6-digit pairing code.
   await view.press({ text: '生成配对码' })
@@ -111,6 +128,7 @@ test('renders bridge status, generates pairing code, saves secret safely, and up
           chatId: 'oc_dm_1',
           chatType: 'p2p',
           conversationKey: 'k1',
+          targetBot: 'MyBot',
           status: 'posted',
           outcome: 'completed',
           promptSummary: '整理发布清单',

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { assert, test } from 'orca/testing'
 import { LocalCallbackServer } from './bot/callback-server'
+import { OrcaWebhookDispatcher } from './bot/webhook-dispatcher'
 import { parseFeishuReceiveEvent } from './lark/feishu-transport'
 import {
   FRAME_METHOD_DATA,
@@ -66,7 +67,7 @@ test('pbbp2.Frame protobuf codec round-trips frames and reassembles split fragme
           chat_type: 'group',
           thread_id: 'omt_789',
           message_type: 'text',
-          content: JSON.stringify({ text: '@_user_1 /agent hello' }),
+          content: JSON.stringify({ text: '@_user_1 /MyBot hello' }),
           mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'MyBot' }]
         }
       }
@@ -188,4 +189,105 @@ test('stdio MCP bridge (`scripts/mcp-bridge.mjs`) authenticates and delivers pro
   } finally {
     await server.stop()
   }
+})
+
+test('OrcaWebhookDispatcher retries fetch failed / 5xx with exponential backoff, exposes err.cause, never leaks URL, and skips retry on 4xx', async () => {
+  const secretWebhookUrl = 'https://hooks.example.test/v1/wh/secret_key_should_never_leak'
+  const basePayload = {
+    request_id: 'req_retry_1',
+    conversation_key: 'conv_1',
+    chat_type: 'p2p' as const,
+    message_id: 'om_retry_1',
+    sender_name: 'Owner',
+    target_bot: 'MyBot',
+    text: 'ping',
+    received_at: new Date().toISOString()
+  }
+
+  // 1. Two transient network failures (`fetch failed` with cause ECONNRESET & HTTP 503), succeeds on attempt 3.
+  const observedDelays: number[] = []
+  const seenRequestIds: string[] = []
+  const logs: string[] = []
+  let callCount = 0
+
+  const dispatcher1 = new OrcaWebhookDispatcher({
+    getWebhookUrl: () => secretWebhookUrl,
+    sleepImpl: async (ms) => {
+      observedDelays.push(ms)
+    },
+    log: (m) => logs.push(m),
+    fetchImpl: (async (_url, init) => {
+      callCount++
+      const body = JSON.parse(String(init?.body ?? '{}')) as { request_id: string }
+      seenRequestIds.push(body.request_id)
+      if (callCount === 1) {
+        const cause = Object.assign(new Error(`connect failed to ${secretWebhookUrl}`), {
+          code: 'ECONNRESET',
+          syscall: 'read'
+        })
+        throw Object.assign(new TypeError('fetch failed'), { cause })
+      }
+      if (callCount === 2) {
+        return new Response('upstream busy', { status: 503 })
+      }
+      return new Response('ok', { status: 200 })
+    }) as typeof fetch
+  })
+
+  const res1 = await dispatcher1.dispatch(basePayload)
+  assert.equal(res1.accepted, true)
+  assert.equal(res1.attempts, 3)
+  assert.deepEqual(observedDelays, [600, 1800])
+  assert.deepEqual(seenRequestIds, ['req_retry_1', 'req_retry_1', 'req_retry_1'])
+  assert.equal(
+    logs.some((line) => line.includes('secret_key_should_never_leak')),
+    false,
+    'logs must never leak webhook URL/key'
+  )
+  assert.equal(
+    logs.some((line) => line.includes('ECONNRESET')),
+    true,
+    'logs must include underlying err.cause code'
+  )
+
+  // 2. All 3 attempts fail with ETIMEDOUT -> error surfaces cause without leaking webhook URL.
+  const failDelays: number[] = []
+  const dispatcher2 = new OrcaWebhookDispatcher({
+    getWebhookUrl: () => secretWebhookUrl,
+    sleepImpl: async (ms) => {
+      failDelays.push(ms)
+    },
+    fetchImpl: (async () => {
+      const cause = Object.assign(new Error(`timeout contacting ${secretWebhookUrl}`), {
+        code: 'ETIMEDOUT'
+      })
+      throw Object.assign(new TypeError('fetch failed'), { cause })
+    }) as typeof fetch
+  })
+  const res2 = await dispatcher2.dispatch(basePayload)
+  assert.equal(res2.accepted, false)
+  assert.equal(res2.attempts, 3)
+  assert.deepEqual(failDelays, [600, 1800])
+  assert.match(res2.error ?? '', /ETIMEDOUT/)
+  assert.equal((res2.error ?? '').includes('secret_key_should_never_leak'), false)
+
+  // 3. Non-retryable 400 fails immediately on attempt 1 without backoff retries.
+  const noRetryDelays: number[] = []
+  let attempts400 = 0
+  const dispatcher3 = new OrcaWebhookDispatcher({
+    getWebhookUrl: () => secretWebhookUrl,
+    sleepImpl: async (ms) => {
+      noRetryDelays.push(ms)
+    },
+    fetchImpl: (async () => {
+      attempts400++
+      return new Response('bad payload', { status: 400 })
+    }) as typeof fetch
+  })
+  const res3 = await dispatcher3.dispatch(basePayload)
+  assert.equal(res3.accepted, false)
+  assert.equal(res3.statusCode, 400)
+  assert.equal(res3.attempts, 1)
+  assert.equal(attempts400, 1)
+  assert.deepEqual(noRetryDelays, [])
 })

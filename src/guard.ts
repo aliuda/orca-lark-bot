@@ -1,6 +1,7 @@
 import { randomInt } from 'node:crypto'
-import type { FeishuChatType, OwnerPairingState, PendingPairingCode } from './types'
 import type { LarkIncomingMessage } from './lark/types'
+import { findBotRouteByName } from './routes'
+import type { BotRouteEntry, FeishuChatType, OwnerPairingState, PendingPairingCode } from './types'
 
 export const PAIRING_TTL_MS = 10 * 60 * 1000
 export const PAIRING_MAX_ATTEMPTS = 5
@@ -36,17 +37,9 @@ export function stripLeadingMentions(text: string): string {
   return out.trim()
 }
 
-/**
- * Matches `/agent` prefix (case-insensitive) followed by whitespace, colon, newline, or end.
- * Does NOT match `/agents` (matches Persona convention).
- */
-export function extractAgentCommand(text: string): { matched: boolean; prompt: string } {
-  const clean = stripLeadingMentions(text)
-  const match = /^\/agent(?=$|[\s:：])[:：]?\s*([\s\S]*)$/i.exec(clean)
-  if (!match) {
-    return { matched: false, prompt: clean }
-  }
-  return { matched: true, prompt: match[1].trim() }
+/** Matches `/pair` command regardless of whether a code argument is attached. */
+export function isPairCommand(text: string): boolean {
+  return /^\/pair(?=$|[\s:：])/i.test(text.trim())
 }
 
 /** Matches `/pair 123456` or raw `123456` in a DM. */
@@ -58,16 +51,40 @@ export function extractPairingAttempt(text: string): string | null {
   return null
 }
 
+/**
+ * Matches `/<BotName>` path-style prefix (case-insensitive exact token match against
+ * configured bot routes, followed by whitespace, newline, colon, or end of text).
+ * Does NOT false-match longer names (e.g. `/MyBot2` will not match `MyBot`).
+ */
+export function extractBotRouteCommand(
+  text: string,
+  routes: readonly BotRouteEntry[]
+): { matched: true; route: BotRouteEntry; prompt: string } | { matched: false; prompt: string } {
+  const clean = stripLeadingMentions(text)
+  const match = /^\/([^\s/:：]+)(?:$|[\s:：])[:：]?\s*([\s\S]*)$/.exec(clean)
+  if (!match) {
+    return { matched: false, prompt: clean }
+  }
+  const route = findBotRouteByName(routes, match[1])
+  if (!route) {
+    return { matched: false, prompt: clean }
+  }
+  return { matched: true, route, prompt: match[2].trim() }
+}
+
 export function buildConversationKey(params: {
   domain: string
   appId: string
+  targetBot?: string
   chatId: string
   chatType: FeishuChatType
   threadId?: string
   rootId?: string
   messageId: string
 }): { tenantAppScope: string; threadOrRootId: string; conversationKey: string } {
-  const tenantAppScope = `${params.domain.replace(/\/+$/, '')}|${params.appId || 'local-app'}`
+  const botScope = params.targetBot?.trim()
+  const baseScope = `${params.domain.replace(/\/+$/, '')}|${params.appId || 'local-app'}`
+  const tenantAppScope = botScope ? `${baseScope}|${botScope.toLowerCase()}` : baseScope
   const threadOrRootId = params.threadId
     ? `thread:${params.threadId}`
     : params.rootId
@@ -85,6 +102,8 @@ export function buildConversationKey(params: {
 export type GuardDecision =
   | {
       action: 'dispatch'
+      targetBot: string
+      webhookUrl: string
       promptText: string
       replyInThreadPreferred: boolean
     }
@@ -102,6 +121,7 @@ export type GuardDecision =
         | 'pairing_invalid'
         | 'pairing_expired'
         | 'pairing_locked'
+        | 'already_paired'
         | 'unauthorized_sender'
         | 'empty_prompt'
     }
@@ -113,6 +133,8 @@ export type GuardDecision =
 export interface GuardContext {
   ownerState: OwnerPairingState
   allowedChatIds: readonly string[]
+  defaultRoute: BotRouteEntry
+  routes: readonly BotRouteEntry[]
   botOpenId?: string
   now: number
 }
@@ -122,13 +144,77 @@ function messageMentionsBot(msg: LarkIncomingMessage, botOpenId?: string): boole
   if (botOpenId) {
     return msg.mentions.some((m) => m.openId === botOpenId)
   }
-  // When botOpenId hasn't been fetched yet, accept any explicit @_user_ mention present in payload.
   return msg.mentions.length > 0
 }
 
+function evaluatePairingVerification(
+  msg: LarkIncomingMessage,
+  ownerState: OwnerPairingState,
+  now: number,
+  defaultBotName: string
+): GuardDecision {
+  const attempt = extractPairingAttempt(msg.text)
+  const pending = ownerState.pendingCode
+  if (!attempt) {
+    return {
+      action: 'reply_only',
+      reason: 'pairing_required',
+      replyText:
+        '当前 Orca Bot 尚未完成 Owner 认主。请在 Orca 右侧「Lark Bot」面板点击「生成配对码」，然后在本私聊发送 `/pair <6位配对码>` 完成绑定。'
+    }
+  }
+  if (!pending) {
+    return {
+      action: 'reply_only',
+      reason: 'pairing_required',
+      replyText:
+        '当前没有有效的配对码。请先在 Orca 右侧「Lark Bot」面板生成新的 6 位配对码后再发送。'
+    }
+  }
+  if (now > pending.expiresAt) {
+    return {
+      action: 'reply_only',
+      reason: 'pairing_expired',
+      nextOwnerState: { ...ownerState, pendingCode: undefined },
+      replyText: '该配对码已过期（有效期 10 分钟）。请在 Orca「Lark Bot」面板重新生成配对码。'
+    }
+  }
+  if (attempt === pending.code) {
+    return {
+      action: 'pair_success',
+      nextOwnerState: {
+        ownerOpenId: msg.senderOpenId,
+        ownerDmChatId: msg.chatId,
+        pairedAt: now,
+        pendingCode: undefined
+      },
+      replyText: `配对成功！已将当前飞书账号绑定为本机 Orca Bot 的唯一 Owner。现在可直接私聊发送需求，或在白名单群内 \`@机器人 /${defaultBotName} <需求>\` 触发。`
+    }
+  }
+  const nextAttempts = pending.attempts + 1
+  if (nextAttempts >= pending.maxAttempts) {
+    return {
+      action: 'reply_only',
+      reason: 'pairing_locked',
+      nextOwnerState: { ...ownerState, pendingCode: undefined },
+      replyText: `配对码错误次数已达上限（${pending.maxAttempts} 次），当前配对码已作废。请在 Orca 面板重新生成。`
+    }
+  }
+  return {
+    action: 'reply_only',
+    reason: 'pairing_invalid',
+    nextOwnerState: {
+      ...ownerState,
+      pendingCode: { ...pending, attempts: nextAttempts }
+    },
+    replyText: `配对码不正确（剩余 ${pending.maxAttempts - nextAttempts} 次机会）。`
+  }
+}
+
 /**
- * Evaluates access control, 6-digit DM owner pairing, DM direct passthrough,
- * and opt-in group allowlist (`@bot /agent ...`) rules.
+ * Evaluates access control, 6-digit DM owner pairing, already-paired `/pair` interception,
+ * DM direct passthrough + `/<BotName>` multi-bot routing, and opt-in group allowlist
+ * (`@bot /<BotName> ...`) rules.
  */
 export function evaluateIncomingMessage(
   msg: LarkIncomingMessage,
@@ -139,72 +225,19 @@ export function evaluateIncomingMessage(
     return { action: 'ignore', reason: 'non_user_sender' }
   }
 
-  const { ownerState, now } = ctx
+  const { ownerState, now, defaultRoute, routes } = ctx
 
   if (msg.chatType === 'p2p') {
     // Unpaired state: only accept 6-digit pairing code in DM; never wake Bot.
     if (!ownerState.ownerOpenId) {
-      const attempt = extractPairingAttempt(msg.text)
-      const pending = ownerState.pendingCode
-      if (!attempt) {
-        return {
-          action: 'reply_only',
-          reason: 'pairing_required',
-          replyText:
-            '当前 Orca Bot 尚未完成 Owner 认主。请在 Orca 右侧「Lark Bot」面板点击「生成 6 位配对码」，然后在本私聊发送 `/pair <6位配对码>` 完成绑定。'
-        }
-      }
-      if (!pending) {
-        return {
-          action: 'reply_only',
-          reason: 'pairing_required',
-          replyText:
-            '当前没有有效的配对码。请先在 Orca 右侧「Lark Bot」面板生成新的 6 位配对码后再发送。'
-        }
-      }
-      if (now > pending.expiresAt) {
-        return {
-          action: 'reply_only',
-          reason: 'pairing_expired',
-          nextOwnerState: { ...ownerState, pendingCode: undefined },
-          replyText: '该配对码已过期（有效期 10 分钟）。请在 Orca「Lark Bot」面板重新生成配对码。'
-        }
-      }
-      if (attempt === pending.code) {
-        return {
-          action: 'pair_success',
-          nextOwnerState: {
-            ownerOpenId: msg.senderOpenId,
-            ownerDmChatId: msg.chatId,
-            pairedAt: now,
-            pendingCode: undefined
-          },
-          replyText:
-            '配对成功！已将当前飞书账号绑定为本机 Orca Bot 的唯一 Owner。现在可直接私聊发送需求，或在白名单群内 `@机器人 /agent <需求>` 触发。'
-        }
-      }
-      const nextAttempts = pending.attempts + 1
-      if (nextAttempts >= pending.maxAttempts) {
-        return {
-          action: 'reply_only',
-          reason: 'pairing_locked',
-          nextOwnerState: { ...ownerState, pendingCode: undefined },
-          replyText: `配对码错误次数已达上限（${pending.maxAttempts} 次），当前配对码已作废。请在 Orca 面板重新生成。`
-        }
-      }
-      return {
-        action: 'reply_only',
-        reason: 'pairing_invalid',
-        nextOwnerState: {
-          ...ownerState,
-          pendingCode: { ...pending, attempts: nextAttempts }
-        },
-        replyText: `配对码不正确（剩余 ${pending.maxAttempts - nextAttempts} 次机会）。`
-      }
+      return evaluatePairingVerification(msg, ownerState, now, defaultRoute.name)
     }
 
-    // Already paired: strictly enforce owner open_id.
+    // Already paired: non-owner DM either validates an active pairing code (if generated) or is rejected.
     if (msg.senderOpenId !== ownerState.ownerOpenId) {
+      if (isPairCommand(msg.text) && ownerState.pendingCode) {
+        return evaluatePairingVerification(msg, ownerState, now, defaultRoute.name)
+      }
       return {
         action: 'reply_only',
         reason: 'unauthorized_sender',
@@ -212,24 +245,39 @@ export function evaluateIncomingMessage(
       }
     }
 
-    // Owner DM: direct passthrough to Bot (strip optional /agent prefix if typed).
-    const parsed = extractAgentCommand(msg.text)
-    const promptText = parsed.matched ? parsed.prompt : msg.text.trim()
+    // Paired Owner sending `/pair` (with or without code): intercept directly without waking Bot.
+    if (isPairCommand(msg.text)) {
+      return {
+        action: 'reply_only',
+        reason: 'already_paired',
+        replyText:
+          '你的飞书账号已完成 Owner 配对，直接发消息即可与机器人对话；如需换绑请在 Orca 右侧「Lark Bot」面板撤销配对。'
+      }
+    }
+
+    // Paired Owner DM: match `/<BotName>` route if present, otherwise route to default `targetBot`.
+    const routeMatch = extractBotRouteCommand(msg.text, routes)
+    const selectedRoute = routeMatch.matched ? routeMatch.route : defaultRoute
+    const promptText = routeMatch.matched ? routeMatch.prompt : msg.text.trim()
     if (!promptText) {
       return {
         action: 'reply_only',
         reason: 'empty_prompt',
-        replyText: '请输入具体需求内容后再发送给 Orca Bot。'
+        replyText: routeMatch.matched
+          ? `请在 \`/${selectedRoute.name}\` 后附带具体任务内容。`
+          : '请输入具体需求内容后再发送给 Orca Bot。'
       }
     }
     return {
       action: 'dispatch',
+      targetBot: selectedRoute.name,
+      webhookUrl: selectedRoute.webhookUrl,
       promptText,
       replyInThreadPreferred: Boolean(msg.threadId || msg.rootId)
     }
   }
 
-  // Group chat: opt-in allowlist + @bot + /agent prefix + owner check.
+  // Group chat: opt-in allowlist + @bot + `/<BotName>` route prefix + owner check.
   if (!ctx.allowedChatIds.includes(msg.chatId)) {
     return { action: 'ignore', reason: 'group_not_allowed' }
   }
@@ -238,8 +286,8 @@ export function evaluateIncomingMessage(
     return { action: 'ignore', reason: 'group_missing_mention_or_prefix' }
   }
 
-  const parsed = extractAgentCommand(msg.text)
-  if (!parsed.matched) {
+  const routeMatch = extractBotRouteCommand(msg.text, routes)
+  if (!routeMatch.matched) {
     return { action: 'ignore', reason: 'group_missing_mention_or_prefix' }
   }
 
@@ -247,21 +295,23 @@ export function evaluateIncomingMessage(
     return {
       action: 'reply_only',
       reason: 'unauthorized_sender',
-      replyText: '仅已配对的本机 Owner 可在白名单群内通过 `@机器人 /agent` 唤醒 Orca Bot。'
+      replyText: `仅已配对的本机 Owner 可在白名单群内通过 \`@机器人 /${routeMatch.route.name}\` 唤醒 Orca Bot。`
     }
   }
 
-  if (!parsed.prompt) {
+  if (!routeMatch.prompt) {
     return {
       action: 'reply_only',
       reason: 'empty_prompt',
-      replyText: '请在 `/agent` 后附带具体任务内容，例如：`@机器人 /agent 帮我看下当前分支改动`。'
+      replyText: `请在 \`/${routeMatch.route.name}\` 后附带具体任务内容，例如：\`@机器人 /${routeMatch.route.name} 帮我看下当前分支改动\`。`
     }
   }
 
   return {
     action: 'dispatch',
-    promptText: parsed.prompt,
+    targetBot: routeMatch.route.name,
+    webhookUrl: routeMatch.route.webhookUrl,
+    promptText: routeMatch.prompt,
     replyInThreadPreferred: true
   }
 }

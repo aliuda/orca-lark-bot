@@ -11,6 +11,7 @@ import { BridgeEngine } from './bridge-engine'
 import { createLarkTransport } from './lark/node-sdk-transport'
 import type { LarkTransport, LarkTransportStatus } from './lark/types'
 import type { SettingsPatch } from './protocol'
+import { findBotRouteByName, resolveBotRoutes } from './routes'
 import { BridgeStore } from './store'
 import type { BridgeSettings, BridgeSnapshot, ConnectionSnapshot, TransportMode } from './types'
 
@@ -62,6 +63,7 @@ function parseSettings(raw: Record<string, JsonValue>): BridgeSettings {
     domain: readString(raw, 'domain', 'https://open.feishu.cn').trim() || 'https://open.feishu.cn',
     targetBot: readString(raw, 'targetBot', 'MyBot').trim() || 'MyBot',
     webhookUrl: readString(raw, 'webhookUrl', '').trim(),
+    botRoutes: readString(raw, 'botRoutes', ''),
     allowedChatIds: readString(raw, 'allowedChatIds', ''),
     transportMode,
     callbackPort: readNumber(raw, 'callbackPort', 0),
@@ -81,6 +83,14 @@ export class BridgeWorkerController {
   private appSecret: string | null = null
   private transport: LarkTransport | null = null
   private callbackServer: LocalCallbackServer | null = null
+  private stopped = false
+  private updatingSettingsFromPanel = false
+  private reconnectInFlight: Promise<{
+    ok: boolean
+    state: ConnectionSnapshot['state']
+    error?: string
+  }> | null = null
+  private reconnectQueued = false
   private transportStatus: LarkTransportStatus = {
     state: 'unconfigured',
     since: Date.now(),
@@ -94,7 +104,21 @@ export class BridgeWorkerController {
     this.store = new BridgeStore(orca.storage)
     this.dispatcher =
       overrides?.createDispatcher?.(() => this.settings) ??
-      new OrcaWebhookDispatcher({ getWebhookUrl: () => this.settings.webhookUrl })
+      new OrcaWebhookDispatcher({
+        getWebhookUrl: (targetBot) => {
+          const { defaultRoute, routes } = resolveBotRoutes({
+            targetBot: this.settings.targetBot,
+            webhookUrl: this.settings.webhookUrl,
+            botRoutes: this.settings.botRoutes
+          })
+          if (targetBot) {
+            const matched = findBotRouteByName(routes, targetBot)
+            if (matched) return matched.webhookUrl
+          }
+          return defaultRoute.webhookUrl
+        },
+        log: (msg) => this.orca.log(msg)
+      })
 
     this.engine = new BridgeEngine({
       store: this.store,
@@ -121,6 +145,66 @@ export class BridgeWorkerController {
 
   getTransport(): LarkTransport | null {
     return this.transport
+  }
+
+  private hasAnyWebhookConfigured(): boolean {
+    const { routes } = resolveBotRoutes({
+      targetBot: this.settings.targetBot,
+      webhookUrl: this.settings.webhookUrl,
+      botRoutes: this.settings.botRoutes
+    })
+    return routes.some((r) => r.webhookUrl.trim().length > 0)
+  }
+
+  private hasCredentialsReady(): boolean {
+    return Boolean(this.settings.appId.trim() && this.appSecret && this.appSecret.trim())
+  }
+
+  private shouldAutoReconnect(credentialsOrDomainChanged: boolean): boolean {
+    if (this.stopped || !this.hasCredentialsReady()) return false
+    const state = this.transportStatus.state
+    if (state === 'unconfigured' || state === 'offline' || state === 'error') {
+      return true
+    }
+    return credentialsOrDomainChanged
+  }
+
+  /**
+   * Triggers a non-blocking reconnect in the background, coalescing back-to-back calls
+   * (for example saving App ID immediately followed by saving App Secret).
+   */
+  private triggerAutoReconnect(): void {
+    if (this.stopped || !this.hasCredentialsReady()) return
+    if (this.reconnectInFlight) {
+      this.reconnectQueued = true
+      return
+    }
+    const run = async (): Promise<{
+      ok: boolean
+      state: ConnectionSnapshot['state']
+      error?: string
+    }> => {
+      try {
+        return await this.connectTransport()
+      } finally {
+        this.reconnectInFlight = null
+        if (this.reconnectQueued && !this.stopped && this.hasCredentialsReady()) {
+          this.reconnectQueued = false
+          this.triggerAutoReconnect()
+        } else {
+          this.reconnectQueued = false
+        }
+      }
+    }
+    this.reconnectInFlight = run()
+    void this.reconnectInFlight.catch(() => undefined)
+  }
+
+  /** Test helper to await any pending background auto-reconnect. */
+  async waitForReconnect(): Promise<void> {
+    while (this.reconnectInFlight) {
+      await this.reconnectInFlight.catch(() => undefined)
+    }
   }
 
   private buildConnectionSnapshot(): ConnectionSnapshot {
@@ -170,6 +254,7 @@ export class BridgeWorkerController {
   }
 
   async start(): Promise<void> {
+    this.stopped = false
     await this.reloadConfig()
     await this.engine.initialize()
 
@@ -178,22 +263,35 @@ export class BridgeWorkerController {
 
     this.disposables.push(
       this.orca.settings.onDidChange(() => {
-        void this.reloadConfig().then(() => {
-          this.engine.emitSnapshot()
-        })
+        if (this.updatingSettingsFromPanel) return
+        void (async () => {
+          const prevAppId = this.settings.appId
+          const prevDomain = this.settings.domain
+          await this.reloadConfig()
+          if (this.hasAnyWebhookConfigured() && !this.callbackServer) {
+            await this.ensureCallbackServer()
+          }
+          const endpointChanged =
+            this.settings.appId !== prevAppId || this.settings.domain !== prevDomain
+          if (this.settings.autoConnect && this.shouldAutoReconnect(endpointChanged)) {
+            this.triggerAutoReconnect()
+          } else {
+            this.engine.emitSnapshot()
+          }
+        })()
       })
     )
 
-    // Start local loopback callback server when webhookUrl is configured or test explicitly asks.
-    if (this.overrides?.startCallbackServer === true || this.settings.webhookUrl.length > 0) {
+    // Start local loopback callback server when any webhook is configured or test explicitly asks.
+    if (this.overrides?.startCallbackServer === true || this.hasAnyWebhookConfigured()) {
       await this.ensureCallbackServer()
     }
 
-    if (this.settings.autoConnect && this.settings.appId && this.appSecret) {
+    if (this.settings.autoConnect && this.hasCredentialsReady()) {
       await this.connectTransport()
     } else {
       this.transportStatus = {
-        state: this.settings.appId && this.appSecret ? 'offline' : 'unconfigured',
+        state: this.hasCredentialsReady() ? 'offline' : 'unconfigured',
         since: (this.overrides?.now ?? Date.now)(),
         transportKind: 'none'
       }
@@ -202,6 +300,8 @@ export class BridgeWorkerController {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true
+    this.reconnectQueued = false
     for (const d of this.disposables) {
       d.dispose()
     }
@@ -224,7 +324,7 @@ export class BridgeWorkerController {
   }
 
   async ensureCallbackServer(): Promise<{ callbackUrl: string; token: string } | null> {
-    if (this.overrides?.startCallbackServer === false) {
+    if (this.overrides?.startCallbackServer === false || this.stopped) {
       return null
     }
     if (this.callbackServer && this.callbackServer.getCallbackUrl()) {
@@ -245,6 +345,10 @@ export class BridgeWorkerController {
       log: (msg) => this.orca.log(msg)
     })
     const info = await server.start()
+    if (this.stopped) {
+      await server.stop().catch(() => undefined)
+      return null
+    }
     this.callbackServer = server
     this.engine.emitSnapshot()
     return { callbackUrl: info.callbackUrl, token: info.token }
@@ -252,7 +356,10 @@ export class BridgeWorkerController {
 
   async connectTransport(): Promise<{ ok: boolean; state: ConnectionSnapshot['state']; error?: string }> {
     await this.reloadConfig()
-    if (!this.settings.appId || !this.appSecret) {
+    if (this.stopped) {
+      return { ok: false, state: 'offline', error: 'Worker stopped' }
+    }
+    if (!this.hasCredentialsReady()) {
       this.transportStatus = {
         state: 'unconfigured',
         since: (this.overrides?.now ?? Date.now)(),
@@ -268,19 +375,25 @@ export class BridgeWorkerController {
       this.transport = null
     }
 
-    if (this.settings.webhookUrl.length > 0 || this.overrides?.startCallbackServer === true) {
+    if (this.hasAnyWebhookConfigured() || this.overrides?.startCallbackServer === true) {
       await this.ensureCallbackServer()
     }
 
     try {
+      const secret = this.appSecret!
       const transport = this.overrides?.createTransport
-        ? await this.overrides.createTransport(this.settings, this.appSecret)
+        ? await this.overrides.createTransport(this.settings, secret)
         : await createLarkTransport(this.settings.transportMode, {
             appId: this.settings.appId,
-            appSecret: this.appSecret,
+            appSecret: secret,
             domain: this.settings.domain,
             log: (msg) => this.orca.log(msg)
           })
+
+      if (this.stopped) {
+        await transport.stop().catch(() => undefined)
+        return { ok: false, state: 'offline', error: 'Worker stopped' }
+      }
 
       this.transport = transport
       this.transportStatus = {
@@ -295,8 +408,10 @@ export class BridgeWorkerController {
           await this.engine.handleIncomingMessage(msg)
         },
         (status) => {
-          this.transportStatus = status
-          this.engine.emitSnapshot()
+          if (this.transport === transport) {
+            this.transportStatus = status
+            this.engine.emitSnapshot()
+          }
         }
       )
 
@@ -322,7 +437,7 @@ export class BridgeWorkerController {
       this.transport = null
     }
     this.transportStatus = {
-      state: this.settings.appId && this.appSecret ? 'offline' : 'unconfigured',
+      state: this.hasCredentialsReady() ? 'offline' : 'unconfigured',
       since: (this.overrides?.now ?? Date.now)(),
       transportKind: 'none'
     }
@@ -341,6 +456,7 @@ export class BridgeWorkerController {
         if (!trimmed) {
           throw Object.assign(new Error('App Secret cannot be empty'), { code: 'invalid_params' })
         }
+        const secretChanged = this.appSecret !== trimmed
         await this.orca.secrets.set(SECRET_APP_SECRET, trimmed)
         this.appSecret = trimmed
         if (this.transportStatus.state === 'unconfigured' && this.settings.appId) {
@@ -351,6 +467,9 @@ export class BridgeWorkerController {
           }
         }
         this.engine.emitSnapshot()
+        if (this.shouldAutoReconnect(secretChanged)) {
+          this.triggerAutoReconnect()
+        }
         return { ok: true as const, hasAppSecret: true }
       }),
 
@@ -380,25 +499,39 @@ export class BridgeWorkerController {
       }),
 
       this.orca.panels.handle('bridge.updateSettings', async (patch: SettingsPatch) => {
+        const prevAppId = this.settings.appId
+        const prevDomain = this.settings.domain
         const keys: (keyof SettingsPatch)[] = [
           'appId',
           'domain',
           'targetBot',
           'webhookUrl',
+          'botRoutes',
           'allowedChatIds'
         ]
-        for (const key of keys) {
-          const val = patch[key]
-          if (typeof val === 'string') {
-            await this.orca.settings.set(key, val)
+        this.updatingSettingsFromPanel = true
+        try {
+          for (const key of keys) {
+            const val = patch[key]
+            if (typeof val === 'string') {
+              await this.orca.settings.set(key, val)
+            }
           }
+        } finally {
+          this.updatingSettingsFromPanel = false
         }
         await this.reloadConfig()
-        if (this.settings.webhookUrl.length > 0 && !this.callbackServer) {
+        if (this.hasAnyWebhookConfigured() && !this.callbackServer) {
           await this.ensureCallbackServer()
         }
+        const credentialsOrDomainChanged =
+          this.settings.appId !== prevAppId || this.settings.domain !== prevDomain
+        const snap = this.engine.getSnapshot()
         this.engine.emitSnapshot()
-        return this.engine.getSnapshot()
+        if (this.shouldAutoReconnect(credentialsOrDomainChanged)) {
+          this.triggerAutoReconnect()
+        }
+        return snap
       }),
 
       this.orca.panels.handle('bridge.sweepTimeouts', async () => {
@@ -422,7 +555,7 @@ export class BridgeWorkerController {
 
       this.orca.commands.register('lark-bot-bridge.status', async () => {
         const snap = this.engine.getSnapshot()
-        return `State=${snap.connection.state}, Bot=${snap.targetBot}, Owner=${
+        return `State=${snap.connection.state}, Bot=${snap.targetBot}, Routes=${snap.routes.length}, Owner=${
           snap.ownerPairing.ownerOpenId ?? 'unpaired'
         }, Requests=${snap.stats.totalRequests}`
       })

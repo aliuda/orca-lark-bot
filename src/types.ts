@@ -24,11 +24,25 @@ export interface BridgeSettings {
   domain: string
   targetBot: string
   webhookUrl: string
+  botRoutes: string
   allowedChatIds: string
   transportMode: TransportMode
   callbackPort: number
   requestTimeoutSec: number
   autoConnect: boolean
+}
+
+export interface BotRouteEntry {
+  name: string
+  webhookUrl: string
+  isDefault: boolean
+}
+
+export interface BotRouteSummary {
+  name: string
+  webhookConfigured: boolean
+  webhookUrlPreview: string
+  isDefault: boolean
 }
 
 export interface ProgressEntry {
@@ -115,6 +129,7 @@ export interface RequestSummary {
   chatType: FeishuChatType
   threadId?: string
   conversationKey: string
+  targetBot: string
   senderName?: string
   status: BridgeRequestStatus
   outcome?: BridgeRequestOutcome
@@ -142,6 +157,7 @@ export interface BridgeSnapshot {
   hasAppSecret: boolean
   webhookConfigured: boolean
   webhookUrlPreview: string
+  routes: BotRouteSummary[]
   allowedChatIds: string[]
   requestTimeoutSec: number
   ownerPairing: OwnerPairingState

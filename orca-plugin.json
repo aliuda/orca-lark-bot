@@ -84,15 +84,24 @@
       {
         "key": "webhookUrl",
         "title": "Orca Bot Webhook URL",
-        "description": "Webhook URL copied from the Bot's webhook.call automation card in Orca.",
+        "description": "Default Webhook URL copied from the target Bot's webhook.call automation card in Orca.",
         "type": "string",
         "default": "",
         "placeholder": "https://..."
       },
       {
+        "key": "botRoutes",
+        "title": "Additional Bot Routes",
+        "description": "Optional /<BotName> routes for multi-bot dispatch, one per line as BotName=WebhookURL (or JSON {\"BotName\":\"WebhookURL\"}). URLs are never logged or shown in plaintext.",
+        "type": "string",
+        "default": "",
+        "multiline": true,
+        "placeholder": "Coder=https://...\nReviewer=https://..."
+      },
+      {
         "key": "allowedChatIds",
         "title": "Allowed Group Chat IDs",
-        "description": "Comma or newline separated opt-in Feishu group chat_ids where @bot /agent is enabled.",
+        "description": "Comma or newline separated opt-in Feishu group chat_ids where @bot /<BotName> is enabled.",
         "type": "string",
         "default": "",
         "multiline": true,
