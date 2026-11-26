@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { assert, test } from 'orca/testing'
@@ -290,4 +291,98 @@ test('OrcaWebhookDispatcher retries fetch failed / 5xx with exponential backoff,
   assert.equal(res3.attempts, 1)
   assert.equal(attempts400, 1)
   assert.deepEqual(noRetryDelays, [])
+})
+
+test('LocalCallbackServer owner-checked stop preserves newer instance runtime.json during overlapping reloads', async () => {
+  const runtimeFilePath = join(
+    tmpdir(),
+    `orca-lark-bridge-reload-race-${process.pid}-${Date.now()}.json`
+  )
+  const completedByB: Array<{ requestId: string; answer: string }> = []
+
+  const serverA = new LocalCallbackServer({
+    port: 0,
+    runtimeFilePath,
+    handlers: {
+      async onProgress() {
+        return { ok: true }
+      },
+      async onComplete() {
+        return { ok: true }
+      },
+      async onFail() {
+        return { ok: true }
+      }
+    }
+  })
+
+  const serverB = new LocalCallbackServer({
+    port: 0,
+    runtimeFilePath,
+    handlers: {
+      async onProgress() {
+        return { ok: true }
+      },
+      async onComplete(input) {
+        completedByB.push(input)
+        return { ok: true }
+      },
+      async onFail() {
+        return { ok: true }
+      }
+    }
+  })
+
+  try {
+    // 1. Instance A starts and writes runtime.json.
+    const infoA = await serverA.start()
+    const rawAfterA = JSON.parse(await readFile(runtimeFilePath, 'utf8')) as {
+      callbackUrl: string
+      token: string
+      pid: number
+    }
+    assert.equal(rawAfterA.callbackUrl, infoA.callbackUrl)
+    assert.equal(rawAfterA.token, infoA.token)
+
+    // 2. Instance B starts on the same runtimeFilePath and atomically overwrites runtime.json.
+    const infoB = await serverB.start()
+    assert.notEqual(infoB.callbackUrl, infoA.callbackUrl)
+    assert.notEqual(infoB.token, infoA.token)
+
+    // 3. Old instance A stops AFTER B started -> must NOT unlink B's runtime.json!
+    await serverA.stop()
+    const rawAfterAStop = JSON.parse(await readFile(runtimeFilePath, 'utf8')) as {
+      callbackUrl: string
+      token: string
+      pid: number
+    }
+    assert.equal(rawAfterAStop.callbackUrl, infoB.callbackUrl)
+    assert.equal(rawAfterAStop.token, infoB.token)
+    assert.equal(rawAfterAStop.pid, process.pid)
+
+    // 4. Callback using runtime.json still reaches instance B with 200 OK.
+    const res = await fetch(`${rawAfterAStop.callbackUrl}/callback/complete`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${rawAfterAStop.token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ request_id: 'req_reload_ok', answer: 'delivered to B' })
+    })
+    assert.equal(res.status, 200)
+    assert.deepEqual(completedByB, [{ requestId: 'req_reload_ok', answer: 'delivered to B' }])
+
+    // 5. Instance B stops -> now runtime.json matches B and is cleanly removed.
+    await serverB.stop()
+    let readAfterBStopFailed = false
+    try {
+      await readFile(runtimeFilePath, 'utf8')
+    } catch {
+      readAfterBStopFailed = true
+    }
+    assert.equal(readAfterBStopFailed, true, 'runtime.json should be unlinked when owner B stops')
+  } finally {
+    await serverA.stop()
+    await serverB.stop()
+  }
 })

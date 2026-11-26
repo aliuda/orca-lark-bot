@@ -1,5 +1,5 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { chmod, mkdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -213,6 +213,7 @@ export class LocalCallbackServer {
 
   async stop(): Promise<void> {
     const server = this.server
+    const ownedCallbackUrl = this.callbackUrl
     this.server = null
     this.callbackUrl = null
     if (server) {
@@ -220,8 +221,37 @@ export class LocalCallbackServer {
         server.close(() => resolve())
       })
     }
-    if (this.runtimeFilePath) {
-      await unlink(this.runtimeFilePath).catch(() => undefined)
+    if (this.runtimeFilePath && ownedCallbackUrl) {
+      await this.removeOwnedRuntimeDescriptor(this.runtimeFilePath, ownedCallbackUrl)
+    }
+  }
+
+  private async removeOwnedRuntimeDescriptor(
+    filePath: string,
+    ownedCallbackUrl: string
+  ): Promise<void> {
+    let raw: string
+    try {
+      raw = await readFile(filePath, 'utf8')
+    } catch {
+      return
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return
+    }
+    const rec = parsed as Record<string, unknown>
+    if (
+      rec.token === this.token &&
+      rec.pid === process.pid &&
+      rec.callbackUrl === ownedCallbackUrl
+    ) {
+      await unlink(filePath).catch(() => undefined)
     }
   }
 
@@ -231,13 +261,18 @@ export class LocalCallbackServer {
   ): Promise<void> {
     const dir = dirname(filePath)
     await mkdir(dir, { recursive: true, mode: 0o700 })
-    const tmpPath = `${filePath}.${process.pid}.tmp`
-    await writeFile(tmpPath, `${JSON.stringify(descriptor, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600
-    })
-    await chmod(tmpPath, 0o600)
-    await rename(tmpPath, filePath)
+    const tmpPath = `${filePath}.${process.pid}-${randomUUID()}.tmp`
+    try {
+      await writeFile(tmpPath, `${JSON.stringify(descriptor, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600
+      })
+      await chmod(tmpPath, 0o600)
+      await rename(tmpPath, filePath)
+    } catch (err) {
+      await unlink(tmpPath).catch(() => undefined)
+      throw err
+    }
   }
 
   private async dispatchCallback(
