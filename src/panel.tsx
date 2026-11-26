@@ -23,7 +23,13 @@ import {
   Text,
   type PanelContext
 } from 'orca'
-import type { BridgeSnapshot, ConnectionState, RequestSummary } from './types'
+import {
+  validateRequestTimeoutSec,
+  type BridgeSnapshot,
+  type ConnectionState,
+  type RequestSummary
+} from './types'
+import type { SettingsPatch } from './protocol'
 
 const snapshotAtom = atom<BridgeSnapshot | null>(null)
 const loadingAtom = atom<boolean>(true)
@@ -35,6 +41,7 @@ const secretDraftAtom = atom('secretDraft', '')
 const appIdDraftAtom = atom('appIdDraft', '')
 const webhookDraftAtom = atom('webhookDraft', '')
 const targetBotDraftAtom = atom('targetBotDraft', '')
+const timeoutDraftAtom = atom('timeoutDraft', '')
 
 function syncDraftsFromSnapshot(snap: BridgeSnapshot): void {
   if (!read(appIdDraftAtom) && snap.appId) {
@@ -42,6 +49,9 @@ function syncDraftsFromSnapshot(snap: BridgeSnapshot): void {
   }
   if (!read(targetBotDraftAtom) && snap.targetBot) {
     set(targetBotDraftAtom, snap.targetBot)
+  }
+  if (!read(timeoutDraftAtom) && snap.requestTimeoutSec) {
+    set(timeoutDraftAtom, String(snap.requestTimeoutSec))
   }
 }
 
@@ -103,16 +113,28 @@ async function handleClearSecret(): Promise<void> {
 }
 
 async function handleSaveQuickConfig(): Promise<void> {
+  const timeoutRaw = read(timeoutDraftAtom).trim()
+  let requestTimeoutSec: number | undefined
+  if (timeoutRaw) {
+    const checked = validateRequestTimeoutSec(timeoutRaw)
+    if (!checked.ok) {
+      set(noticeAtom, { tone: 'warning', text: '请求超时需为 5–3600 之间的整数秒（默认 600 秒 = 10 分钟）。' })
+      return
+    }
+    requestTimeoutSec = checked.value
+  }
   await runAction('saveConfig', async () => {
-    const patch: { appId?: string; targetBot?: string; webhookUrl?: string } = {}
+    const patch: SettingsPatch = {}
     const appId = read(appIdDraftAtom).trim()
     const targetBot = read(targetBotDraftAtom).trim()
     const webhookUrl = read(webhookDraftAtom).trim()
     if (appId) patch.appId = appId
     if (targetBot) patch.targetBot = targetBot
     if (webhookUrl) patch.webhookUrl = webhookUrl
+    if (requestTimeoutSec !== undefined) patch.requestTimeoutSec = requestTimeoutSec
     const snap = await plugin.request('bridge.updateSettings', patch)
     set(snapshotAtom, snap)
+    set(timeoutDraftAtom, String(snap.requestTimeoutSec))
     if (webhookUrl) set(webhookDraftAtom, '')
     set(noticeAtom, {
       tone: 'success',
@@ -463,6 +485,15 @@ export default function LarkBotPanel() {
             value={read(webhookDraftAtom)}
             onChange={(val) => set(webhookDraftAtom, val)}
           />
+          <Input
+            label="Request Timeout (s)"
+            placeholder="600"
+            value={read(timeoutDraftAtom)}
+            onChange={(val) => set(timeoutDraftAtom, val)}
+          />
+          <Text size="xs" muted>
+            Bot 未回调时超过该秒数即标记超时并更新飞书卡片（5–3600，默认 600 秒 = 10 分钟；仅对新请求生效）。
+          </Text>
           <Row gap="xs">
             <Button
               size="sm"

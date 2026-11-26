@@ -66,7 +66,7 @@ test('concurrent out-of-order completion routes each answer back to its exact me
       targetBot: 'MyBot',
       webhookUrl: 'https://orca.local/webhook/mock',
       allowedChatIds: 'oc_team_group',
-      requestTimeoutSec: 300,
+      requestTimeoutSec: 600,
       autoConnect: true
     },
     secrets: { [SECRET_APP_SECRET]: 'sec_test_123' }
@@ -704,6 +704,46 @@ test('automatically triggers non-blocking reconnect after saving App ID/domain a
   assert.equal(createdTransports.length, 2)
   assert.equal(createdTransports[1].domain, 'https://open.larksuite.com')
   assert.deepEqual(worker.refusals, [])
+
+  await worker.deactivate()
+})
+
+test('defaults requestTimeoutSec to 600s and validates/persists bridge.updateSettings({ requestTimeoutSec })', async () => {
+  setWorkerTestOverrides({ startCallbackServer: false })
+
+  const host = mockHost({
+    settings: {
+      appId: '',
+      domain: 'https://open.feishu.cn',
+      targetBot: 'MyBot',
+      webhookUrl: '',
+      autoConnect: false
+    }
+  })
+
+  const worker = await mountWorker(main, { host })
+
+  // No persisted value -> 10 minute default.
+  const initial = await worker.request('bridge.getSnapshot')
+  assert.equal(initial.requestTimeoutSec, 600)
+
+  // Valid integer is persisted to settings and applied to the live engine config.
+  const updated = await worker.request('bridge.updateSettings', { requestTimeoutSec: 1200 })
+  assert.equal(updated.requestTimeoutSec, 1200)
+  assert.equal((await worker.request('bridge.getSnapshot')).requestTimeoutSec, 1200)
+  assert.equal(host.data().settings.requestTimeoutSec, 1200)
+
+  // Out-of-range, fractional and non-numeric values are rejected without persisting anything.
+  for (const bad of [4, 3601, 12.5, Number.NaN, 'abc' as unknown as number]) {
+    await assert.rejects(worker.request('bridge.updateSettings', { requestTimeoutSec: bad, targetBot: 'Other' }))
+  }
+  const after = await worker.request('bridge.getSnapshot')
+  assert.equal(after.requestTimeoutSec, 1200)
+  assert.equal(after.targetBot, 'MyBot')
+
+  // Boundaries are accepted.
+  assert.equal((await worker.request('bridge.updateSettings', { requestTimeoutSec: 5 })).requestTimeoutSec, 5)
+  assert.equal((await worker.request('bridge.updateSettings', { requestTimeoutSec: 3600 })).requestTimeoutSec, 3600)
 
   await worker.deactivate()
 })

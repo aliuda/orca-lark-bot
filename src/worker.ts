@@ -13,7 +13,16 @@ import type { LarkTransport, LarkTransportStatus } from './lark/types'
 import type { SettingsPatch } from './protocol'
 import { findBotRouteByName, resolveBotRoutes } from './routes'
 import { BridgeStore } from './store'
-import type { BridgeSettings, BridgeSnapshot, ConnectionSnapshot, TransportMode } from './types'
+import {
+  DEFAULT_REQUEST_TIMEOUT_SEC,
+  MAX_REQUEST_TIMEOUT_SEC,
+  MIN_REQUEST_TIMEOUT_SEC,
+  validateRequestTimeoutSec,
+  type BridgeSettings,
+  type BridgeSnapshot,
+  type ConnectionSnapshot,
+  type TransportMode
+} from './types'
 
 export const SECRET_APP_SECRET = 'feishu.appSecret'
 const STATUS_BAR_ID = 'lark-bridge-status'
@@ -67,7 +76,13 @@ function parseSettings(raw: Record<string, JsonValue>): BridgeSettings {
     allowedChatIds: readString(raw, 'allowedChatIds', ''),
     transportMode,
     callbackPort: readNumber(raw, 'callbackPort', 0),
-    requestTimeoutSec: Math.max(5, readNumber(raw, 'requestTimeoutSec', 300)),
+    requestTimeoutSec: Math.min(
+      MAX_REQUEST_TIMEOUT_SEC,
+      Math.max(
+        MIN_REQUEST_TIMEOUT_SEC,
+        Math.round(readNumber(raw, 'requestTimeoutSec', DEFAULT_REQUEST_TIMEOUT_SEC))
+      )
+    ),
     autoConnect: readBoolean(raw, 'autoConnect', true)
   }
 }
@@ -505,14 +520,21 @@ export class BridgeWorkerController {
       this.orca.panels.handle('bridge.updateSettings', async (patch: SettingsPatch) => {
         const prevAppId = this.settings.appId
         const prevDomain = this.settings.domain
-        const keys: (keyof SettingsPatch)[] = [
+        const keys = [
           'appId',
           'domain',
           'targetBot',
           'webhookUrl',
           'botRoutes',
           'allowedChatIds'
-        ]
+        ] as const
+        // Validate before persisting anything so a bad timeout never leaves a half-applied patch.
+        let requestTimeoutSec: number | undefined
+        if (patch.requestTimeoutSec !== undefined) {
+          const checked = validateRequestTimeoutSec(patch.requestTimeoutSec)
+          if (!checked.ok) throw new Error(checked.error)
+          requestTimeoutSec = checked.value
+        }
         this.updatingSettingsFromPanel = true
         try {
           for (const key of keys) {
@@ -520,6 +542,9 @@ export class BridgeWorkerController {
             if (typeof val === 'string') {
               await this.orca.settings.set(key, val)
             }
+          }
+          if (requestTimeoutSec !== undefined) {
+            await this.orca.settings.set('requestTimeoutSec', requestTimeoutSec)
           }
         } finally {
           this.updatingSettingsFromPanel = false

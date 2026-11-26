@@ -136,9 +136,9 @@
       {
         "key": "requestTimeoutSec",
         "title": "Request Timeout (seconds)",
-        "description": "Seconds before marking an unanswered Bot request as timed out and updating the Feishu card.",
+        "description": "Seconds before marking an unanswered Bot request as timed out and updating the Feishu card (default 600 = 10 minutes).",
         "type": "integer",
-        "default": 300,
+        "default": 600,
         "minimum": 5,
         "maximum": 3600
       },

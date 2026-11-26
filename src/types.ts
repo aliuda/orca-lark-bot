@@ -1,3 +1,25 @@
+/** Default seconds before an unanswered Bot request times out (10 minutes). */
+export const DEFAULT_REQUEST_TIMEOUT_SEC = 600
+export const MIN_REQUEST_TIMEOUT_SEC = 5
+export const MAX_REQUEST_TIMEOUT_SEC = 3600
+
+/**
+ * Validates a request timeout coming from the panel / bridge.updateSettings.
+ * Returns the integer seconds, or an error message when it is not an integer within range.
+ */
+export function validateRequestTimeoutSec(
+  value: unknown
+): { ok: true; value: number } | { ok: false; error: string } {
+  const num = typeof value === 'string' && value.trim() !== '' ? Number(value.trim()) : value
+  if (typeof num !== 'number' || !Number.isInteger(num)) {
+    return { ok: false, error: `requestTimeoutSec must be an integer between ${MIN_REQUEST_TIMEOUT_SEC} and ${MAX_REQUEST_TIMEOUT_SEC}` }
+  }
+  if (num < MIN_REQUEST_TIMEOUT_SEC || num > MAX_REQUEST_TIMEOUT_SEC) {
+    return { ok: false, error: `requestTimeoutSec must be between ${MIN_REQUEST_TIMEOUT_SEC} and ${MAX_REQUEST_TIMEOUT_SEC} seconds (got ${num})` }
+  }
+  return { ok: true, value: num }
+}
+
 export type BridgeRequestStatus =
   | 'received'
   | 'dispatched'

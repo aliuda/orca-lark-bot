@@ -39,7 +39,7 @@ function makeSnapshot(overrides: Partial<BridgeSnapshot> = {}): BridgeSnapshot {
       }
     ],
     allowedChatIds: ['oc_team_1'],
-    requestTimeoutSec: 300,
+    requestTimeoutSec: 600,
     ownerPairing: {},
     recentRequests: [],
     stats: {
@@ -151,6 +151,44 @@ test('renders bridge status, generates pairing code, saves secret safely, and up
   assert.ok(view.find({ text: 'Online' }))
   assert.ok(view.find({ text: 'Paired' }))
   assert.ok(view.find({ type: 'ListItem', text: /整理发布清单/ }))
+
+  assert.deepEqual(view.errors, [])
+  assert.deepEqual(view.warnings, [])
+  assert.deepEqual(view.refusals, [])
+})
+
+test('shows the 600s default request timeout and saves a validated timeout via bridge.updateSettings', async () => {
+  let state = makeSnapshot()
+  const patches: unknown[] = []
+
+  const host = mockHost({
+    requests: {
+      'bridge.getSnapshot': () => state,
+      'bridge.updateSettings': (patch) => {
+        patches.push(patch)
+        if (typeof patch.requestTimeoutSec === 'number') {
+          state = { ...state, requestTimeoutSec: patch.requestTimeoutSec }
+        }
+        return state
+      }
+    }
+  })
+
+  view = await mount(panel, { host })
+  assert.equal(view.valueOf({ label: 'Request Timeout (s)' }), '600')
+
+  // Out-of-range value is rejected in the panel and never sent to the worker.
+  await view.type({ label: 'Request Timeout (s)' }, '4000', { replace: true })
+  await view.press({ text: '保存基础配置' })
+  assert.equal(patches.length, 0)
+  assert.ok(view.find({ text: /5–3600/ }))
+
+  // Valid value is sent as an integer and reflected back from the worker snapshot.
+  await view.type({ label: 'Request Timeout (s)' }, '900', { replace: true })
+  await view.press({ text: '保存基础配置' })
+  assert.equal(patches.length, 1)
+  assert.equal((patches[0] as { requestTimeoutSec?: number }).requestTimeoutSec, 900)
+  assert.equal(view.valueOf({ label: 'Request Timeout (s)' }), '900')
 
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.warnings, [])

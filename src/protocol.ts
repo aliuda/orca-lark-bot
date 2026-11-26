@@ -2,7 +2,10 @@
 import type { BridgeSettings, BridgeSnapshot, ConnectionState } from './types'
 
 export type SettingsPatch = Partial<
-  Pick<BridgeSettings, 'appId' | 'domain' | 'targetBot' | 'webhookUrl' | 'botRoutes' | 'allowedChatIds'>
+  Pick<
+    BridgeSettings,
+    'appId' | 'domain' | 'targetBot' | 'webhookUrl' | 'botRoutes' | 'allowedChatIds' | 'requestTimeoutSec'
+  >
 >
 
 declare module 'orca' {
@@ -28,7 +31,10 @@ declare module 'orca' {
     }
     /** Disconnects the active Feishu transport cleanly. */
     'bridge.disconnect': { output: { ok: true } }
-    /** Updates basic bridge settings from the sidebar panel. */
+    /**
+     * Updates basic bridge settings from the sidebar panel.
+     * `requestTimeoutSec` must be an integer in 5..3600; anything else is rejected without persisting.
+     */
     'bridge.updateSettings': {
       input: SettingsPatch
       output: BridgeSnapshot

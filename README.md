@@ -97,6 +97,10 @@ Reviewer=https://<webhook-url-for-reviewer>
 
 > Webhook URL 仅保存在插件配置中，日志、错误提示与右侧面板均只展示脱敏路由名，绝不回显明文 URL 或密钥。
 
+### 请求超时（可选）
+
+Bot 未通过 MCP 回调完成/失败时，桥接会在 **`requestTimeoutSec`** 秒后将请求标记为超时并更新飞书卡片。默认 **600 秒（10 分钟）**，可设范围 `5–3600`。可在 Orca 设置 → Plugins → **Lark Bot Bridge** → **Request Timeout (seconds)** 修改，或在右侧 `Lark Bot` 面板的 **Request Timeout (s)** 输入框中填写后点击「保存基础配置」（通过 `bridge.updateSettings` 校验并持久化，仅对新请求生效）。
+
 ---
 
 ## 开发与校验
